@@ -2,7 +2,7 @@ from ansible.executor import playbook_executor
 from ansible.utils.ssh_functions import check_for_controlpersist
 from ansible import constants as C
 
-from subspace.internal.task_queue_manager import SubspaceTaskQueueManager
+from .task_queue_manager import SubspaceTaskQueueManager
 
 
 class SubspacePlaybookExecutor(playbook_executor.PlaybookExecutor):
