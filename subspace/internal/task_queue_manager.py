@@ -1,18 +1,23 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import multiprocessing
 import os
+import tempfile
 
 from ansible.errors import AnsibleError
 from ansible.executor.play_iterator import PlayIterator
+from ansible.executor.stats import AggregateStats
 from ansible.playbook.play_context import PlayContext
-from ansible.plugins import strategy_loader
+from ansible.plugins.loader import strategy_loader
 from ansible.template import Templar
 from ansible.utils.helpers import pct_to_int
 from ansible.vars.hostvars import HostVars
 from ansible.vars.reserved import warn_if_reserved
 
+# Subspace-specific includes
 from ansible.executor.task_queue_manager import TaskQueueManager
+# End-subspace-specific includes
 
 try:
     from __main__ import display
@@ -20,13 +25,16 @@ except ImportError:
     from ansible.utils.display import Display
     display = Display()
 
+
 __all__ = ['SubspaceTaskQueueManager']
 
 
 class SubspaceTaskQueueManager(TaskQueueManager):
 
     '''
-    The SubspaceTaskQueueManager will inject itself as the default strategy to retrieve improved logging
+    The SubspaceTaskQueueManager works identically to the TaskQueueManager
+    *WITH ONE EXCEPTION:*
+      - the default strategy for all playbooks is 'subspace'
     '''
     default_strategy = 'subspace'  # Use the subspace strategy by default.
 
@@ -42,7 +50,7 @@ class SubspaceTaskQueueManager(TaskQueueManager):
         if not self._callbacks_loaded:
             self.load_callbacks()
 
-        all_vars = self._variable_manager.get_vars(loader=self._loader, play=play)
+        all_vars = self._variable_manager.get_vars(play=play)
         warn_if_reserved(all_vars)
         templar = Templar(loader=self._loader, variables=all_vars)
 
@@ -56,22 +64,6 @@ class SubspaceTaskQueueManager(TaskQueueManager):
             loader=self._loader,
         )
 
-        # Fork # of forks, # of hosts or serial, whichever is lowest
-        num_hosts = len(self._inventory.get_hosts(new_play.hosts, ignore_restrictions=True))
-
-        max_serial = 0
-        if new_play.serial:
-            # the play has not been post_validated here, so we may need
-            # to convert the scalar value to a list at this point
-            serial_items = new_play.serial
-            if not isinstance(serial_items, list):
-                serial_items = [serial_items]
-            max_serial = max([pct_to_int(x, num_hosts) for x in serial_items])
-
-        contenders = [self._options.forks, max_serial, num_hosts]
-        contenders = [v for v in contenders if v is not None and v > 0]
-        self._initialize_processes(min(contenders))
-
         play_context = PlayContext(new_play, self._options, self.passwords, self._connection_lockfile.fileno())
         for callback_plugin in self._callback_plugins:
             if hasattr(callback_plugin, 'set_play_context'):
@@ -83,6 +75,19 @@ class SubspaceTaskQueueManager(TaskQueueManager):
         self._initialize_notified_handlers(new_play)
 
 
+        # build the iterator
+        iterator = PlayIterator(
+            inventory=self._inventory,
+            play=new_play,
+            play_context=play_context,
+            variable_manager=self._variable_manager,
+            all_vars=all_vars,
+            start_at_done=self._start_at_done,
+        )
+
+        # adjust to # of workers to configured forks or size of batch, whatever is lower
+        self._initialize_processes(min(self._options.forks, iterator.batch_size))
+
         ##################
         # Subspace snippet
 
@@ -93,21 +98,11 @@ class SubspaceTaskQueueManager(TaskQueueManager):
         #  this hack will ensure
         # 'Subspace' linear strategy is what gets used.
         strategy = self._ensure_subspace_plugin(new_play)
-        # END subspace snippet
-        ##################
 
         if strategy is None:
             raise AnsibleError("Invalid play strategy specified: %s" % new_play.strategy, obj=play._ds)
-
-        # build the iterator
-        iterator = PlayIterator(
-            inventory=self._inventory,
-            play=new_play,
-            play_context=play_context,
-            variable_manager=self._variable_manager,
-            all_vars=all_vars,
-            start_at_done = self._start_at_done,
-        )
+        # END subspace snippet
+        ##################
 
         # Because the TQM may survive multiple play runs, we start by marking
         # any hosts as failed in the iterator here which may have been marked
@@ -137,20 +132,24 @@ class SubspaceTaskQueueManager(TaskQueueManager):
         return play_return
 
     def _ensure_subspace_plugin(self, new_play):
+        """
+        # This method will force-override plays to use 'subspace' as the default strategy.
+        # In the future, there may be a better/cleaner way to do this
+        # When such a time comes, feel free to drop this function.
+        """
         from subspace.plugins.strategy.subspace import StrategyModule
 
-        # NOTE: Requires *ALL* strategies to use subspace-linear for now.
         new_play.strategy = self.default_strategy
 
-        # NOTE: Removing this line still causes failures in ansible2.3
+        # FIXME test if this can be removed in 2.4: Removing this line still causes failures in ansible2.3
         subspace_dir = os.path.dirname(__file__)
         strategy_loader.config = os.path.join(subspace_dir, 'plugins/strategy')
 
         # Load subspace strategy
         strategy = strategy_loader.get(new_play.strategy, self)
-
         if strategy is None or not isinstance(strategy, StrategyModule):
             strategy = StrategyModule(self)
         if not isinstance(strategy, StrategyModule):
             raise AnsibleError("Invalid play strategy specified: %s" % new_play.strategy, obj=new_play._ds)
         return strategy
+

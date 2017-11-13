@@ -2,21 +2,23 @@ from ansible.executor import playbook_executor
 from ansible.utils.ssh_functions import check_for_controlpersist
 from ansible import constants as C
 
-from subspace.task_queue_manager import SubspaceTaskQueueManager
+from subspace.internal.task_queue_manager import SubspaceTaskQueueManager
 
-class PlaybookExecutor(playbook_executor.PlaybookExecutor):
+
+class SubspacePlaybookExecutor(playbook_executor.PlaybookExecutor):
     '''
-    This is an extension of ansible playbook_excutor.PlaybookExecutor
-    Its sole purpose is to provide the ability to pass a *custom* TaskQueueManager.
+    The SubspacePlaybookExecutor works identically to the PlaybookExecutor defined by ansible,
+    *WITH ONE EXCEPTION:*
+      - Override the default `task_queue_manager` to be SubspaceTaskQueueManager
     '''
 
     def __init__(self, playbooks, inventory, variable_manager, loader, options, passwords):
-        self._playbooks        = playbooks
-        self._inventory        = inventory
+        self._playbooks = playbooks
+        self._inventory = inventory
         self._variable_manager = variable_manager
-        self._loader           = loader
-        self._options          = options
-        self.passwords         = passwords
+        self._loader = loader
+        self._options = options
+        self.passwords = passwords
         self._unreachable_hosts = dict()
 
         if options.listhosts or options.listtasks or options.listtags or options.syntax:

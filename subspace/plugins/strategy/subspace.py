@@ -1,26 +1,18 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-from ansible.compat.six import iteritems, text_type
-
-from ansible.errors import AnsibleError
-from ansible.template import Templar
-
-from ansible.compat.six.moves import queue as Queue
-from ansible.inventory.host import Host
-from ansible.vars.unsafe_proxy import wrap_var
-
-#Some deep level cruft
-from ansible import constants as C
 from jinja2.exceptions import UndefinedError
-from ansible.errors import AnsibleParserError, AnsibleUndefinedVariable
-from ansible.module_utils._text import to_text
-from ansible.compat.six import string_types
-from ansible.playbook.helpers import load_list_of_blocks
+
+from ansible import constants as C
+from ansible.errors import AnsibleError, AnsibleParserError, AnsibleUndefinedVariable
 from ansible.executor.task_result import TaskResult
+from ansible.module_utils.six import iteritems, string_types
+from ansible.module_utils._text import to_text
+from ansible.playbook.helpers import load_list_of_blocks
 from ansible.playbook.task_include import TaskInclude
 from ansible.playbook.role_include import IncludeRole
-from ansible.vars import combine_vars, strip_internal_keys
+from ansible.template import Templar
+from ansible.vars.manager import strip_internal_keys
 
 from ansible.plugins.strategy import StrategyBase \
     as AnsibleStrategyBase
@@ -32,17 +24,17 @@ except ImportError:
     from ansible.utils.display import Display
     display = Display()
 
-from subspace.task_queue_manager import SubspaceTaskQueueManager as SubspaceTQM
+from subspace.internal.task_queue_manager import SubspaceTaskQueueManager as SubspaceTQM
 __all__ = ['StrategyModule']
 
 
 class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
 
-    def increment_stat(self, what, host_name, play, task):
+    def subspace_increment_stat(self, what, host_name, play, task):
         if type(self._tqm) == SubspaceTQM:
             return self._tqm._stats.increment(what, host_name, play, task)
         else:
-            self._tqm.send_callback('record_log', "Using the 'traditional' TQM results in loss of functionality")
+            self._tqm.send_callback('record_log', "Subspace strategy expects `self._tqm` to be `subspace.internal.task_queue_manager.SubspaceTaskQueueManager`.", "warn")
             return self._tqm._stats.increment(what, host_name)
 
     def _process_pending_results(self, iterator, one_pass=False, max_passes=None):
@@ -50,12 +42,14 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
         Reads results off the final queue and takes appropriate action
         based on the result (executing callbacks, updating state, etc.).
         '''
+
         ret_results = []
 
         def get_original_host(host_name):
+            # FIXME: this should not need x2 _inventory
             host_name = to_text(host_name)
-            if host_name in self._inventory._hosts_cache:
-                return self._inventory._hosts_cache[host_name]
+            if host_name in self._inventory.hosts:
+                return self._inventory.hosts[host_name]
             else:
                 return self._inventory.get_host(host_name)
 
@@ -63,7 +57,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
             for handler_block in handler_blocks:
                 for handler_task in handler_block.block:
                     if handler_task.name:
-                        handler_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, task=handler_task)
+                        handler_vars = self._variable_manager.get_vars(play=iterator._play, task=handler_task)
                         templar = Templar(loader=self._loader, variables=handler_vars)
                         try:
                             # first we check with the full result of get_name(), which may
@@ -85,7 +79,6 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                             continue
             return None
 
-
         def search_handler_blocks_by_uuid(handler_uuid, handler_blocks):
             for handler_block in handler_blocks:
                 for handler_task in handler_block.block:
@@ -97,7 +90,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
             if target_handler:
                 if isinstance(target_handler, (TaskInclude, IncludeRole)):
                     try:
-                        handler_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, task=target_handler)
+                        handler_vars = self._variable_manager.get_vars(play=iterator._play, task=target_handler)
                         templar = Templar(loader=self._loader, variables=handler_vars)
                         target_handler_name = templar.template(target_handler.name)
                         if target_handler_name == handler_name:
@@ -116,7 +109,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
         while True:
             try:
                 self._results_lock.acquire()
-                task_result = self._results.pop()
+                task_result = self._results.popleft()
             except IndexError:
                 break
             finally:
@@ -127,8 +120,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
             found_task = iterator.get_original_task(original_host, task_result._task)
             original_task = found_task.copy(exclude_parent=True, exclude_tasks=True)
             original_task._parent = found_task._parent
-            for (attr, val) in iteritems(task_result._task_fields):
-                setattr(original_task, attr, val)
+            original_task.from_attrs(task_result._task_fields)
 
             task_result._host = original_host
             task_result._task = original_task
@@ -183,7 +175,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                         iterator.mark_host_failed(original_host)
 
                     # increment the failed count for this host
-                    self.increment_stat('failures', original_host.name, iterator._play, original_task)
+                    self.subspace_increment_stat('failures', original_host.name, iterator._play, original_task)
 
                     # grab the current state and if we're iterating on the rescue portion
                     # of a block then we save the failed task in a special var for use
@@ -202,17 +194,17 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                             ),
                         )
                 else:
-                    self.increment_stat('ok', original_host.name, iterator._play, original_task)
+                    self.subspace_increment_stat('ok', original_host.name, iterator._play, original_task)
                     if 'changed' in task_result._result and task_result._result['changed']:
-                        self.increment_stat('changed', original_host.name, iterator._play, original_task)
+                        self.subspace_increment_stat('changed', original_host.name, iterator._play, original_task)
                 self._tqm.send_callback('v2_runner_on_failed', task_result, ignore_errors=ignore_errors)
             elif task_result.is_unreachable():
                 self._tqm._unreachable_hosts[original_host.name] = True
                 iterator._play._removed_hosts.append(original_host.name)
-                self.increment_stat('dark', original_host.name, iterator._play, original_task)
+                self.subspace_increment_stat('dark', original_host.name, iterator._play, original_task)
                 self._tqm.send_callback('v2_runner_on_unreachable', task_result)
             elif task_result.is_skipped():
-                self.increment_stat('skipped', original_host.name, iterator._play, original_task)
+                self.subspace_increment_stat('skipped', original_host.name, iterator._play, original_task)
                 self._tqm.send_callback('v2_runner_on_skipped', task_result)
             else:
                 role_ran = True
@@ -222,7 +214,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                     # loop over all of them instead of a single result
                     result_items = task_result._result.get('results', [])
                 else:
-                    result_items = [ task_result._result ]
+                    result_items = [task_result._result]
 
                 for result_item in result_items:
                     if '_ansible_notify' in result_item:
@@ -240,6 +232,8 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                                 target_handler = search_handler_blocks_by_name(handler_name, iterator._play.handlers)
                                 if target_handler is not None:
                                     found = True
+                                    if target_handler._uuid not in self._notified_handlers:
+                                        self._notified_handlers[target_handler._uuid] = []
                                     if original_host not in self._notified_handlers[target_handler._uuid]:
                                         self._notified_handlers[target_handler._uuid].append(original_host)
                                         # FIXME: should this be a callback?
@@ -268,7 +262,8 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
 
                                 # and if none were found, then we raise an error
                                 if not found:
-                                    msg = "The requested handler '%s' was not found in either the main handlers list nor in the listening handlers list" % handler_name
+                                    msg = ("The requested handler '%s' was not found in either the main handlers list nor in the listening "
+                                           "handlers list" % handler_name)
                                     if C.ERROR_ON_MISSING_HANDLER:
                                         raise AnsibleError(msg)
                                     else:
@@ -285,30 +280,26 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
 
                     if 'ansible_facts' in result_item:
 
+                        # if delegated fact and we are delegating facts, we need to change target host for them
+                        if original_task.delegate_to is not None and original_task.delegate_facts:
+                            host_list = self.get_delegated_hosts(result_item, original_task)
+                        else:
+                            host_list = self.get_task_hosts(iterator, original_host, original_task)
+
                         if original_task.action == 'include_vars':
-
-                            if original_task.delegate_to is not None:
-                                host_list = self.get_delegated_hosts(result_item, original_task)
-                            else:
-                                host_list = self.get_task_hosts(iterator, original_host, original_task)
-
                             for (var_name, var_value) in iteritems(result_item['ansible_facts']):
                                 # find the host we're actually referring too here, which may
                                 # be a host that is not really in inventory at all
                                 for target_host in host_list:
                                     self._variable_manager.set_host_variable(target_host, var_name, var_value)
                         else:
-                            # if delegated fact and we are delegating facts, we need to change target host for them
-                            if original_task.delegate_to is not None and original_task.delegate_facts:
-                                host_list = self.get_delegated_hosts(result_item, original_task)
-                            else:
-                                host_list = self.get_task_hosts(iterator, original_host, original_task)
-
+                            cacheable = result_item.pop('ansible_facts_cacheable', True)
                             for target_host in host_list:
-                                if original_task.action == 'set_fact':
-                                    self._variable_manager.set_nonpersistent_facts(target_host, result_item['ansible_facts'].copy())
-                                else:
+                                if cacheable:
                                     self._variable_manager.set_host_facts(target_host, result_item['ansible_facts'].copy())
+
+                                # If we are setting a fact, it should populate non_persistent_facts as well
+                                self._variable_manager.set_nonpersistent_facts(target_host, result_item['ansible_facts'].copy())
 
                     if 'ansible_stats' in result_item and 'data' in result_item['ansible_stats'] and result_item['ansible_stats']['data']:
 
@@ -330,10 +321,10 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                     if self._diff:
                         self._tqm.send_callback('v2_on_file_diff', task_result)
 
-                if original_task.action not in ['include', 'include_role']:
-                    self.increment_stat('ok', original_host.name, iterator._play, original_task)
+                if not isinstance(original_task, TaskInclude):
+                    self.subspace_increment_stat('ok', original_host.name, iterator._play, original_task)
                     if 'changed' in task_result._result and task_result._result['changed']:
-                        self.increment_stat('changed', original_host.name, iterator._play, original_task)
+                        self.subspace_increment_stat('changed', original_host.name, iterator._play, original_task)
 
                 # finally, send the ok for this task
                 self._tqm.send_callback('v2_runner_on_ok', task_result)
@@ -344,7 +335,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
 
             # If this is a role task, mark the parent role as being run (if
             # the task was ok or failed, but not skipped or unreachable)
-            if original_task._role is not None and role_ran: #TODO:  and original_task.action != 'include_role':?
+            if original_task._role is not None and role_ran:  # TODO:  and original_task.action != 'include_role':?
                 # lookup the role in the ROLE_CACHE to make sure we're dealing
                 # with the correct object and mark it as executed
                 for (entry, role_obj) in iteritems(iterator._play.ROLE_CACHE[original_task._role._role_name]):
@@ -353,7 +344,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
 
             ret_results.append(task_result)
 
-            if one_pass or max_passes is not None and (cur_pass+1) >= max_passes:
+            if one_pass or max_passes is not None and (cur_pass + 1) >= max_passes:
                 break
 
             cur_pass += 1
@@ -383,8 +374,9 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                 tags = tags.split(',')
             if len(tags) > 0:
                 if len(included_file._task.tags) > 0:
-                    raise AnsibleParserError("Include tasks should not specify tags in more than one way (both via args and directly on the task). Mixing tag specify styles is prohibited for whole import hierarchy, not only for single import statement",
-                            obj=included_file._task._ds)
+                    raise AnsibleParserError("Include tasks should not specify tags in more than one way (both via args and directly on the task). "
+                                             "Mixing tag specify styles is prohibited for whole import hierarchy, not only for single import statement",
+                                             obj=included_file._task._ds)
                 display.deprecated("You should not specify tags in the include parameters. All tags should be specified using the task-level option")
                 included_file._task.tags = tags
 
@@ -404,7 +396,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
             # since we skip incrementing the stats when the task result is
             # first processed, we do so now for each host in the list
             for host in included_file._hosts:
-                self.increment_stat('ok', host.name, iterator._play, included_file._task)
+                self.subspace_increment_stat('ok', host.name, iterator._play, included_file._task)
 
         except AnsibleError as e:
             # mark all of the hosts including this file as failed, send callbacks,
@@ -413,7 +405,7 @@ class StrategyModule(AnsibleLinearStrategyModule, AnsibleStrategyBase):
                 tr = TaskResult(host=host, task=included_file._task, return_data=dict(failed=True, reason=to_text(e)))
                 iterator.mark_host_failed(host)
                 self._tqm._failed_hosts[host.name] = True
-                self.increment_stat('failures', host.name, iterator._play, included_file._task)
+                self.subspace_increment_stat('failures', host.name, iterator._play, included_file._task)
                 self._tqm.send_callback('v2_runner_on_failed', tr)
             return []
 
